@@ -294,6 +294,24 @@ func MarshalTransportMsg(peerID PeerID, payload []byte) ([]byte, error) {
 	return msg, nil
 }
 
+// MarshalTransportMsgInto writes a transport message into the provided buffer, growing it only
+// if it is too small to hold the header and payload. It returns the slice that contains the
+// message (a sub-slice of buf when buf was large enough). This lets callers reuse a pooled
+// buffer across packets instead of allocating a new slice per message.
+func MarshalTransportMsgInto(buf []byte, peerID PeerID, payload []byte) ([]byte, error) {
+	total := headerTotalSizeTransport + len(payload)
+	if cap(buf) < total {
+		buf = make([]byte, total)
+	} else {
+		buf = buf[:total]
+	}
+	buf[0] = byte(CurrentProtocolVersion)
+	buf[1] = byte(MsgTypeTransport)
+	copy(buf[sizeOfProtoHeader:], peerID[:])
+	copy(buf[sizeOfProtoHeader+peerIDSize:], payload)
+	return buf, nil
+}
+
 // UnmarshalTransportMsg extracts the peerID and the payload from the transport message.
 func UnmarshalTransportMsg(buf []byte) (*PeerID, []byte, error) {
 	if len(buf) < headerTotalSizeTransport {
