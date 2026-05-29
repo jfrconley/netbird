@@ -623,8 +623,13 @@ func (c *Client) writeTo(containerRef *connContainer, dstID messages.PeerID, pay
 		return 0, net.ErrClosed
 	}
 
-	// todo: use buffer pool instead of create new transport msg.
-	msg, err := messages.MarshalTransportMsg(dstID, payload)
+	// Reuse a pooled buffer for the transport message instead of allocating one per packet.
+	// relayConn.Write copies the bytes into the underlying WS/QUIC frame and does not retain
+	// the slice, so the buffer is safe to return to the pool as soon as Write returns.
+	bufPtr := c.bufPool.Get().(*[]byte)
+	defer c.bufPool.Put(bufPtr)
+
+	msg, err := messages.MarshalTransportMsgInto((*bufPtr)[:0], dstID, payload)
 	if err != nil {
 		c.log.Errorf("failed to marshal transport message: %s", err)
 		return 0, err
