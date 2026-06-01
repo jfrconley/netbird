@@ -318,6 +318,18 @@ func UnmarshalTransportID(buf []byte) (*PeerID, error) {
 	return &id, nil
 }
 
+// UnmarshalTransportIDInto extracts the destination peerID from a transport message into dst,
+// without allocating. It returns false if the buffer is too short to contain a transport header.
+func UnmarshalTransportIDInto(buf []byte, dst *PeerID) bool {
+	if len(buf) < headerTotalSizeTransport {
+		return false
+	}
+
+	const offsetEnd = offsetTransportID + peerIDSize
+	copy(dst[:], buf[offsetTransportID:offsetEnd])
+	return true
+}
+
 // UpdateTransportMsg updates the peerID in the transport message.
 // With this function the server can reuse the given byte slice to update the peerID in the transport message. So do
 // need to allocate a new byte slice.

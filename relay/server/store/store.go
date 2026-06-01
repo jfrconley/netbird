@@ -2,6 +2,7 @@ package store
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/netbirdio/netbird/shared/relay/messages"
 )
@@ -11,84 +12,105 @@ type IPeer interface {
 	ID() messages.PeerID
 }
 
-// Store is a thread-safe store of peers
-// It is used to store the peers that are connected to the relay server
+type peerMap = map[messages.PeerID]IPeer
+
+// Store is a thread-safe store of peers.
+// It is used to store the peers that are connected to the relay server.
+//
+// The read path (Peer/Peers/GetOnlinePeers...) is lock-free: it does a single atomic load of an
+// immutable map. Writers (AddPeer/DeletePeer) are serialized by writeMu and publish a fresh copy of
+// the map (copy-on-write). Reads dominate by orders of magnitude (one lookup per forwarded packet)
+// while writes happen only on connect/disconnect, so this trades cheap rare writes for a contention-
+// free hot path.
 type Store struct {
-	peers     map[messages.PeerID]IPeer
-	peersLock sync.RWMutex
+	peers   atomic.Pointer[peerMap]
+	writeMu sync.Mutex
 }
 
 // NewStore creates a new Store instance
 func NewStore() *Store {
-	return &Store{
-		peers: make(map[messages.PeerID]IPeer),
-	}
+	s := &Store{}
+	m := make(peerMap)
+	s.peers.Store(&m)
+	return s
 }
 
-// AddPeer adds a peer to the store
-// If the peer already exists, it will be replaced and the old peer will be closed
+func (s *Store) load() peerMap {
+	return *s.peers.Load()
+}
+
+// AddPeer adds a peer to the store.
+// If the peer already exists, it will be replaced and the old peer will be closed.
 // Returns true if the peer was replaced, false if it was added for the first time.
 func (s *Store) AddPeer(peer IPeer) bool {
-	s.peersLock.Lock()
-	defer s.peersLock.Unlock()
-	odlPeer, ok := s.peers[peer.ID()]
-	if ok {
-		odlPeer.Close()
-	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
-	s.peers[peer.ID()] = peer
+	old := s.load()
+	nm := make(peerMap, len(old)+1)
+	for k, v := range old {
+		nm[k] = v
+	}
+	existing, ok := nm[peer.ID()]
+	nm[peer.ID()] = peer
+	s.peers.Store(&nm)
+
+	// Close the replaced peer only after publishing the new map, so concurrent readers never
+	// route a packet to a peer that has already been closed but is still present in the map.
+	if ok {
+		existing.Close()
+	}
 	return ok
 }
 
-// DeletePeer deletes a peer from the store
+// DeletePeer deletes a peer from the store.
+// It only deletes the peer if the stored pointer is identical to the given one.
 func (s *Store) DeletePeer(peer IPeer) bool {
-	s.peersLock.Lock()
-	defer s.peersLock.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
-	dp, ok := s.peers[peer.ID()]
-	if !ok {
-		return false
-	}
-	if dp != peer {
+	old := s.load()
+	cur, ok := old[peer.ID()]
+	if !ok || cur != peer {
 		return false
 	}
 
-	delete(s.peers, peer.ID())
+	nm := make(peerMap, len(old))
+	for k, v := range old {
+		if k == peer.ID() {
+			continue
+		}
+		nm[k] = v
+	}
+	s.peers.Store(&nm)
 	return true
 }
 
 // Peer returns a peer by its ID
 func (s *Store) Peer(id messages.PeerID) (IPeer, bool) {
-	s.peersLock.RLock()
-	defer s.peersLock.RUnlock()
-
-	p, ok := s.peers[id]
+	p, ok := s.load()[id]
 	return p, ok
 }
 
 // Peers returns all the peers in the store
 func (s *Store) Peers() []IPeer {
-	s.peersLock.RLock()
-	defer s.peersLock.RUnlock()
-
-	peers := make([]IPeer, 0, len(s.peers))
-	for _, p := range s.peers {
+	m := s.load()
+	peers := make([]IPeer, 0, len(m))
+	for _, p := range m {
 		peers = append(peers, p)
 	}
 	return peers
 }
 
 func (s *Store) GetOnlinePeersAndRegisterInterest(peerIDs []messages.PeerID, listener *Listener) []messages.PeerID {
-	s.peersLock.RLock()
-	defer s.peersLock.RUnlock()
-
-	onlinePeers := make([]messages.PeerID, 0, len(peerIDs))
-
 	listener.AddInterestedPeers(peerIDs)
+
+	m := s.load()
+	onlinePeers := make([]messages.PeerID, 0, len(peerIDs))
 
 	// Check for currently online peers
 	for _, id := range peerIDs {
-		if _, ok := s.peers[id]; ok {
+		if _, ok := m[id]; ok {
 			onlinePeers = append(onlinePeers, id)
 		}
 	}

@@ -17,6 +17,8 @@ import (
 	"github.com/hashicorp/go-multierror"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 
 	"github.com/netbirdio/netbird/encryption"
 	"github.com/netbirdio/netbird/relay/healthcheck"
@@ -33,6 +35,7 @@ type Config struct {
 	// it is a domain:port or ip:port
 	ExposedAddress     string
 	MetricsPort        int
+	DisableMetrics     bool
 	LetsencryptEmail   string
 	LetsencryptDataDir string
 	LetsencryptDomains []string
@@ -106,6 +109,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&cobraConfig.ListenAddress, "listen-address", "l", ":443", "listen address")
 	rootCmd.PersistentFlags().StringVarP(&cobraConfig.ExposedAddress, "exposed-address", "e", "", "instance domain address (or ip) and port, it will be distributes between peers")
 	rootCmd.PersistentFlags().IntVar(&cobraConfig.MetricsPort, "metrics-port", 9090, "metrics endpoint http port. Metrics are accessible under host:metrics-port/metrics")
+	rootCmd.PersistentFlags().BoolVar(&cobraConfig.DisableMetrics, "disable-metrics", false, "disable the Prometheus metrics endpoint and use a no-op meter (removes per-packet metric recording overhead)")
 	rootCmd.PersistentFlags().StringVarP(&cobraConfig.LetsencryptDataDir, "letsencrypt-data-dir", "d", "", "a directory to store Let's Encrypt data. Required if Let's Encrypt is enabled.")
 	rootCmd.PersistentFlags().StringSliceVarP(&cobraConfig.LetsencryptDomains, "letsencrypt-domains", "a", nil, "list of domains to issue Let's Encrypt certificate for. Enables TLS using Let's Encrypt. Will fetch and renew certificate, and run the server with TLS")
 	rootCmd.PersistentFlags().StringVar(&cobraConfig.LetsencryptEmail, "letsencrypt-email", "", "email address to use for Let's Encrypt certificate registration")
@@ -149,10 +153,20 @@ func execute(cmd *cobra.Command, args []string) error {
 
 	// Resource creation phase (fail fast before starting any goroutines)
 
-	metricsServer, err := metrics.NewServer(cobraConfig.MetricsPort, "")
-	if err != nil {
-		log.Debugf("setup metrics: %v", err)
-		return fmt.Errorf("setup metrics: %v", err)
+	var (
+		metricsServer *metrics.Metrics
+		meter         metric.Meter
+	)
+	if cobraConfig.DisableMetrics {
+		log.Infof("metrics endpoint disabled, using no-op meter")
+		meter = noop.NewMeterProvider().Meter("")
+	} else {
+		metricsServer, err = metrics.NewServer(cobraConfig.MetricsPort, "")
+		if err != nil {
+			log.Debugf("setup metrics: %v", err)
+			return fmt.Errorf("setup metrics: %v", err)
+		}
+		meter = metricsServer.Meter
 	}
 
 	srvListenerCfg := server.ListenerConfig{
@@ -176,7 +190,7 @@ func execute(cmd *cobra.Command, args []string) error {
 	authenticator := auth.NewTimedHMACValidator(hashedSecret[:], 24*time.Hour)
 
 	cfg := server.Config{
-		Meter:          metricsServer.Meter,
+		Meter:          meter,
 		ExposedAddress: cobraConfig.ExposedAddress,
 		AuthValidator:  authenticator,
 		TLSSupport:     tlsSupport,
@@ -217,14 +231,16 @@ func execute(cmd *cobra.Command, args []string) error {
 }
 
 func startServers(wg *sync.WaitGroup, metricsServer *metrics.Metrics, srv *server.Server, srvListenerCfg server.ListenerConfig, httpHealthcheck *healthcheck.Server, stunServer *stun.Server) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		log.Infof("running metrics server: %s%s", metricsServer.Addr, metricsServer.Endpoint)
-		if err := metricsServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("failed to start metrics server: %v", err)
-		}
-	}()
+	if metricsServer != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			log.Infof("running metrics server: %s%s", metricsServer.Addr, metricsServer.Endpoint)
+			if err := metricsServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("failed to start metrics server: %v", err)
+			}
+		}()
+	}
 
 	instanceURL := srv.InstanceURL()
 	log.Infof("server will be available on: %s", instanceURL.String())
@@ -275,9 +291,11 @@ func shutdownServers(ctx context.Context, metricsServer *metrics.Metrics, srv *s
 		errs = multierror.Append(errs, fmt.Errorf("failed to close relay server: %w", err))
 	}
 
-	log.Infof("shutting down metrics server")
-	if err := metricsServer.Shutdown(ctx); err != nil {
-		errs = multierror.Append(errs, fmt.Errorf("failed to close metrics server: %w", err))
+	if metricsServer != nil {
+		log.Infof("shutting down metrics server")
+		if err := metricsServer.Shutdown(ctx); err != nil {
+			errs = multierror.Append(errs, fmt.Errorf("failed to close metrics server: %w", err))
+		}
 	}
 
 	return errs

@@ -7,6 +7,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/metric"
+
+	"github.com/netbirdio/netbird/shared/relay/messages"
 )
 
 const (
@@ -22,8 +24,8 @@ type Metrics struct {
 	PeerStoreTime      metric.Float64Histogram
 	peerReconnections  metric.Int64Counter
 	peers              metric.Int64UpDownCounter
-	peerActivityChan   chan string
-	peerLastActive     map[string]time.Time
+	peerActivityChan   chan messages.PeerID
+	peerLastActive     map[messages.PeerID]time.Time
 	mutexActivity      sync.Mutex
 	ctx                context.Context
 }
@@ -97,8 +99,8 @@ func NewMetrics(ctx context.Context, meter metric.Meter) (*Metrics, error) {
 		peerReconnections:  peerReconnections,
 
 		ctx:              ctx,
-		peerActivityChan: make(chan string, 10),
-		peerLastActive:   make(map[string]time.Time),
+		peerActivityChan: make(chan messages.PeerID, 10),
+		peerLastActive:   make(map[messages.PeerID]time.Time),
 	}
 
 	_, err = meter.RegisterCallback(
@@ -119,7 +121,7 @@ func NewMetrics(ctx context.Context, meter metric.Meter) (*Metrics, error) {
 }
 
 // PeerConnected increments the number of connected peers and increments number of idle connections
-func (m *Metrics) PeerConnected(id string) {
+func (m *Metrics) PeerConnected(id messages.PeerID) {
 	m.peers.Add(m.ctx, 1)
 	m.mutexActivity.Lock()
 	defer m.mutexActivity.Unlock()
@@ -138,7 +140,7 @@ func (m *Metrics) RecordPeerStoreTime(duration time.Duration) {
 }
 
 // PeerDisconnected decrements the number of connected peers and decrements number of idle or active connections
-func (m *Metrics) PeerDisconnected(id string) {
+func (m *Metrics) PeerDisconnected(id messages.PeerID) {
 	m.peers.Add(m.ctx, -1)
 	m.mutexActivity.Lock()
 	defer m.mutexActivity.Unlock()
@@ -151,7 +153,7 @@ func (m *Metrics) RecordPeerReconnection() {
 }
 
 // PeerActivity increases the active connections
-func (m *Metrics) PeerActivity(peerID string) {
+func (m *Metrics) PeerActivity(peerID messages.PeerID) {
 	select {
 	case m.peerActivityChan <- peerID:
 	default:

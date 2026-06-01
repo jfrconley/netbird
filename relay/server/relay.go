@@ -113,7 +113,39 @@ func NewRelay(config Config) (*Relay, error) {
 		return nil, fmt.Errorf("prepare message: %v", err)
 	}
 
+	go r.maintenanceLoop(ctx)
+
 	return r, nil
+}
+
+const (
+	// writeStallTimeout preserves the previous per-write 10s timeout semantics: a peer whose write
+	// has been in flight longer than this is reaped by the maintenance loop.
+	writeStallTimeout = 10 * time.Second
+	// maintenanceInterval is how often the maintenance loop scans connections for stalled writes.
+	maintenanceInterval = 2 * time.Second
+)
+
+// maintenanceLoop periodically reaps connections whose write has stalled. It runs in a single
+// goroutine that never writes to a connection, so it cannot itself be blocked by a stuck write
+// (unlike the per-peer healthcheck goroutine, which shares the connection's serialized write path).
+func (r *Relay) maintenanceLoop(ctx context.Context) {
+	ticker := time.NewTicker(maintenanceInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now().UnixNano()
+			for _, ip := range r.store.Peers() {
+				if p, ok := ip.(*Peer); ok {
+					p.closeIfWriteStalled(now, writeStallTimeout)
+				}
+			}
+		}
+	}
 }
 
 // Accept start to handle a new peer connection
@@ -155,14 +187,14 @@ func (r *Relay) Accept(conn listener.Conn) {
 	r.notifier.PeerCameOnline(peer.ID())
 
 	r.metrics.RecordPeerStoreTime(time.Since(storeTime))
-	r.metrics.PeerConnected(peer.String())
+	r.metrics.PeerConnected(peer.ID())
 	go func() {
 		peer.Work()
 		if deleted := r.store.DeletePeer(peer); deleted {
 			r.notifier.PeerWentOffline(peer.ID())
 		}
 		peer.log.Debugf("relay connection closed")
-		r.metrics.PeerDisconnected(peer.String())
+		r.metrics.PeerDisconnected(peer.ID())
 	}()
 
 	if err := h.handshakeResponse(hsCtx); err != nil {

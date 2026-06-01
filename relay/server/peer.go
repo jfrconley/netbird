@@ -121,7 +121,7 @@ func (p *Peer) handleMsgType(ctx context.Context, msgType messages.MsgType, hc *
 		hc.OnHCResponse()
 	case messages.MsgTypeTransport:
 		p.metrics.TransferBytesRecv.Add(ctx, int64(n))
-		p.metrics.PeerActivity(p.String())
+		p.metrics.PeerActivity(p.id)
 		p.handleTransportMsg(msg)
 	case messages.MsgTypeClose:
 		p.log.Infof("peer exited gracefully")
@@ -142,6 +142,28 @@ func (p *Peer) Write(ctx context.Context, b []byte) (int, error) {
 	p.connMu.RLock()
 	defer p.connMu.RUnlock()
 	return p.conn.Write(ctx, b)
+}
+
+// writeStallChecker is implemented by transports that can report a stuck (in-flight too long) write.
+// It lets the relay's maintenance loop reap connections whose write has blocked, since the per-write
+// path no longer arms a per-packet timeout context.
+type writeStallChecker interface {
+	WriteStalled(nowUnixNano int64, timeout time.Duration) bool
+}
+
+// closeIfWriteStalled closes the peer connection if its transport reports a write that has been
+// in flight longer than timeout. Transports that cannot stall (e.g. QUIC datagrams) are skipped.
+func (p *Peer) closeIfWriteStalled(nowUnixNano int64, timeout time.Duration) {
+	sc, ok := p.conn.(writeStallChecker)
+	if !ok {
+		return
+	}
+	if sc.WriteStalled(nowUnixNano, timeout) {
+		p.log.Warnf("write stalled for more than %s, closing peer", timeout)
+		if err := p.conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			p.log.Errorf(errCloseConn, err)
+		}
+	}
 }
 
 // CloseGracefully closes the connection with the peer gracefully. Send a close message to the client and close the
@@ -207,21 +229,20 @@ func (p *Peer) handleHealthcheckEvents(ctx context.Context, hc *healthcheck.Send
 }
 
 func (p *Peer) handleTransportMsg(msg []byte) {
-	peerID, err := messages.UnmarshalTransportID(msg)
-	if err != nil {
-		p.log.Errorf("failed to unmarshal transport message: %s", err)
+	var peerID messages.PeerID
+	if !messages.UnmarshalTransportIDInto(msg, &peerID) {
+		p.log.Errorf("failed to unmarshal transport message: invalid length")
 		return
 	}
 
-	item, ok := p.store.Peer(*peerID)
+	item, ok := p.store.Peer(peerID)
 	if !ok {
 		p.log.Debugf("peer not found: %s", peerID)
 		return
 	}
 	dp := item.(*Peer)
 
-	err = messages.UpdateTransportMsg(msg, p.id)
-	if err != nil {
+	if err := messages.UpdateTransportMsg(msg, p.id); err != nil {
 		p.log.Errorf("failed to update transport message: %s", err)
 		return
 	}
